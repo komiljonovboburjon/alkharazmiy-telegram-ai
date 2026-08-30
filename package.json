@@ -1,0 +1,12 @@
+{
+  "name": "alkharazmiy-telegram-ai",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "groq-sdk": "^0.29.0"
+  }
+}
