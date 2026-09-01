@@ -4,7 +4,10 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
-const NEWS_PAGE = "https://gov.uz/oz/uzbmb";
+const NEWS_PAGE = "https://gov.uz/uz/uzbmb/news/view/208834";
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 function cleanText(html) {
   return html
@@ -15,6 +18,7 @@ function cleanText(html) {
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -34,90 +38,123 @@ async function fetchPage(url) {
 }
 
 /*
-  gov.uz yangiliklar sahifasidan maqola linklarini topadi.
+  gov.uz NEWS PAGE'dan maqola linklarini topish.
 */
 async function getNewsLinks() {
   const html = await fetchPage(NEWS_PAGE);
 
   const links = [];
-  const regex = /href=["']([^"']*\/news\/view\/[^"']+)["']/gi;
+
+  const regex =
+    /(?:href|url)\s*[:=]\s*["']([^"']*\/(?:oz|uz)\/uzbmb\/news\/view\/\d+)["']/gi;
 
   let match;
 
   while ((match = regex.exec(html)) !== null) {
-    const url = new URL(match[1], NEWS_PAGE).href;
+    try {
+      const url = new URL(match[1], NEWS_PAGE).href;
 
-    if (!links.includes(url)) {
-      links.push(url);
+      if (
+        url.includes("/uzbmb/news/view/") &&
+        !links.includes(url)
+      ) {
+        links.push(url);
+      }
+    } catch {}
+  }
+
+  /*
+    Agar HTML ichidan topilmasa, qidiruv sahifasidagi
+    ko'rinadigan URL formatlarini boshqa regex bilan tekshiramiz.
+  */
+  if (!links.length) {
+    const fallbackRegex =
+      /https?:\/\/gov\.uz\/(?:oz|uz)\/uzbmb\/news\/view\/\d+/gi;
+
+    let fallback;
+
+    while ((fallback = fallbackRegex.exec(html)) !== null) {
+      if (!links.includes(fallback[0])) {
+        links.push(fallback[0]);
+      }
     }
   }
 
-  return links.slice(0, 15);
+  return [...new Set(links)].slice(0, 20);
 }
 
 /*
-  Yangilikning O'Z sahifasidan:
-  - title
-  - sana
-  - matn
-  - asosiy rasm
-  olinadi.
+  Maqolaning o'zidan:
+  title
+  date
+  image
+  text
 */
 async function getNewsArticle(url) {
   const html = await fetchPage(url);
 
-  // Title
   let title = null;
 
-  const ogTitle = html.match(
-    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
-  );
-
-  if (ogTitle) {
-    title = ogTitle[1];
-  }
-
-  if (!title) {
-    const titleTag = html.match(
+  const titleMatches = [
+    html.match(
+      /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
+    ),
+    html.match(
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i
+    ),
+    html.match(
       /<title[^>]*>([\s\S]*?)<\/title>/i
-    );
+    )
+  ];
 
-    if (titleTag) {
-      title = cleanText(titleTag[1]);
+  for (const match of titleMatches) {
+    if (match?.[1]) {
+      title = cleanText(match[1]);
+      break;
     }
   }
 
-  // Asosiy rasm
   let image = null;
 
-  const ogImage =
+  const imageMatches = [
     html.match(
       /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
-    ) ||
+    ),
     html.match(
       /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i
-    );
+    ),
+    html.match(
+      /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i
+    )
+  ];
 
-  if (ogImage) {
-    image = new URL(ogImage[1], url).href;
+  for (const match of imageMatches) {
+    if (match?.[1]) {
+      try {
+        image = new URL(match[1], url).href;
+        break;
+      } catch {}
+    }
   }
 
-  // Sana
   let date = null;
 
-  const dateMatch =
+  const dateMatches = [
     html.match(
-      /datetime=["']([^"']+)["']/i
-    ) ||
+      /datetime=["'](202\d-\d\d-\d\d[^"']*)["']/i
+    ),
     html.match(
-      /202\d-\d\d-\d\d[^<]*/i
-    );
+      /(202\d-\d\d-\d\d\s+\d\d:\d\d:\d\d)/
+    )
+  ];
 
-  if (dateMatch) {
-    date = dateMatch[1];
+  for (const match of dateMatches) {
+    if (match?.[1]) {
+      date = match[1];
+      break;
+    }
   }
 
-  // Matn
   const text = cleanText(html);
 
   return {
@@ -130,7 +167,98 @@ async function getNewsArticle(url) {
 }
 
 /*
-  Maqolalardan eng dolzarbini AI tanlaydi.
+  Supabase'da bu yangilik oldin yuborilganmi?
+*/
+async function isPosted(url) {
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/telegram_posts?source_url=eq.${encodeURIComponent(url)}&select=id`,
+    {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Supabase check error: ${response.status}`
+    );
+  }
+
+  const data = await response.json();
+
+  return data.length > 0;
+}
+
+/*
+  Yuborilgan maqolani Supabase'ga saqlash.
+*/
+async function savePostedArticle(article) {
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/telegram_posts`,
+    {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=ignore-duplicates"
+      },
+      body: JSON.stringify({
+        source_url: article.url,
+        title: article.title,
+        image_url: article.image
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Supabase save error: ${response.status} ${await response.text()}`
+    );
+  }
+}
+
+/*
+  Yangi maqolalardan yuborilmaganlarini ajratish.
+*/
+async function getNewArticles() {
+  const links = await getNewsLinks();
+
+  console.log("Found links:", links.length);
+
+  const articles = [];
+
+  for (const link of links.slice(0, 12)) {
+    try {
+      const alreadyPosted = await isPosted(link);
+
+      if (alreadyPosted) {
+        console.log("Already posted:", link);
+        continue;
+      }
+
+      const article = await getNewsArticle(link);
+
+      if (article.title && article.text) {
+        articles.push(article);
+      }
+
+    } catch (error) {
+      console.error(
+        "Article error:",
+        link,
+        error.message
+      );
+    }
+  }
+
+  return articles;
+}
+
+/*
+  AI eng yaxshi yangilikni tanlaydi.
 */
 async function chooseNews(articles) {
   const simplified = articles.map((article, index) => ({
@@ -140,106 +268,124 @@ async function chooseNews(articles) {
     url: article.url
   }));
 
-  const completion = await groq.chat.completions.create({
-    model: "openai/gpt-oss-20b",
-    messages: [
-      {
-        role: "system",
-        content: `
-Sen ALKHARAZMIY Telegram kanalining yangilik tanlovchisisan.
+  const completion =
+    await groq.chat.completions.create({
+      model: "openai/gpt-oss-20b",
 
-Berilgan maqolalar FAQAT rasmiy Bilim va malakalarni
-baholash agentligi manbasidan olingan.
+      messages: [
+        {
+          role: "system",
+          content: `
+Sen ALKHARAZMIY Telegram kanalining
+yangilik tanlovchisisan.
 
-Eng dolzarb va o'quvchilar uchun foydali BIRTA maqolani tanla.
+Berilgan maqolalarning barchasi
+Bilim va malakalarni baholash agentligining
+rasmiy gov.uz manbasidan olingan.
 
-Afzallik:
-1. Yangi maqola
-2. Milliy Sertifikatga aloqador
-3. O'quvchilarga amaliy foydasi bor
-4. Muhim rasmiy o'zgarish yoki e'lon
+Eng foydali BIRTA maqolani tanla.
 
-Eski yoki takroriy yangilikni tanlama.
+Ustuvorlik:
+
+1. Eng yangi
+2. Milliy Sertifikat bilan bog'liq
+3. Abituriyentlar uchun muhim
+4. Amaliy foydasi bor
+5. Muhim rasmiy o'zgarish yoki e'lon
 
 Faqat JSON qaytar:
+
 {"index": 0}
 
 Boshqa hech narsa yozma.
 `
-      },
-      {
-        role: "user",
-        content: JSON.stringify(simplified)
-      }
-    ],
-    temperature: 0.2,
-    max_tokens: 50
-  });
+        },
+        {
+          role: "user",
+          content: JSON.stringify(simplified)
+        }
+      ],
 
-  const answer = completion.choices[0].message.content;
+      temperature: 0.1,
+      max_tokens: 50
+    });
+
+  const answer =
+    completion.choices[0].message.content.trim();
 
   try {
     const parsed = JSON.parse(answer);
-    return articles[parsed.index];
-  } catch {
-    return articles[0];
-  }
+
+    if (
+      typeof parsed.index === "number" &&
+      articles[parsed.index]
+    ) {
+      return articles[parsed.index];
+    }
+  } catch {}
+
+  return articles[0];
 }
 
 /*
-  Yangilik asosida Telegram posti.
+  Telegram post yaratish.
 */
 async function generatePost(article) {
-  const systemPrompt = `
-Sen ALKHARAZMIY Telegram kanalining AI kontent menejerisan.
+  const completion =
+    await groq.chat.completions.create({
+      model: "openai/gpt-oss-20b",
+
+      messages: [
+        {
+          role: "system",
+          content: `
+Sen ALKHARAZMIY Telegram kanalining
+AI kontent menejerisan.
 
 ALKHARAZMIY:
 https://alkharazmiy.xyz
 
-ALKHARAZMIY — turli fanlar bo'yicha Milliy Sertifikat
-imtihonlariga tayyorgarlik uchun online mock testlar
-va AI tahlil platformasi.
+ALKHARAZMIY turli fanlar bo'yicha
+Milliy Sertifikat imtihonlariga tayyorgarlik
+uchun online mock test va AI tahlil
+platformasidir.
 
-MUHIM:
+Muhim:
 ALKHARAZMIY faqat matematika platformasi emas.
 
-SENING VAZIFANG:
-Rasmiy yangilikni Telegram uchun qiziqarli,
-qisqa va foydali postga aylantirish.
+Vazifang:
+Rasmiy yangilikni Telegram uchun
+qiziqarli va foydali postga aylantirish.
 
 QOIDALAR:
 
-- Faqat berilgan rasmiy maqoladagi faktlardan foydalan.
-- Hech qanday faktni o'ylab topma.
-- Sana, raqam, imtihon yoki tartibni o'zgartirma.
+- Faqat berilgan maqoladagi faktlardan foydalan.
+- Hech narsa o'ylab topma.
+- Sana va raqamlarni o'zgartirma.
 - Maqolada yo'q ma'lumotni qo'shma.
-- Yangilikni haddan tashqari uzun qilib yuborma.
-- Bitta asosiy g'oyani ajratib ko'rsat.
-- O'quvchiga hamma tafsilotni birdaniga berma.
-- Qiziqish uyg'ot.
+- Juda uzun yozma.
+- Bitta asosiy mavzuni yorit.
+- Hamma tafsilotni birdaniga berma.
+- O'quvchida qiziqish uyg'ot.
 - Clickbait ishlatma.
+- Tabiiy o'zbek tilida yoz.
+- Telegram uchun qisqa paragraflardan foydalan.
+- Emoji me'yorida bo'lsin.
 
-USLUB:
-
-- O'zbek tilida.
-- Tabiiy.
-- Zamonaviy.
-- Telegramga mos.
-- Qisqa paragraflar.
-- Emoji me'yorida.
-
-ALKHARAZMIY'ni faqat kerak bo'lsa tabiiy tarzda eslat.
+ALKHARAZMIY'ni faqat tabiiy joyda eslat.
 
 Agar mos bo'lsa:
+
 👉 Batafsil:
 https://alkharazmiy.xyz
 
 FAQAT POST MATNINI QAYTAR.
-JSON qaytarma.
-Izoh yozma.
-`;
-
-  const userPrompt = `
+JSON yoki izoh qaytarma.
+`
+        },
+        {
+          role: "user",
+          content: `
 RASMIY MANBA:
 ${article.url}
 
@@ -252,99 +398,88 @@ ${article.title}
 MAQOLA:
 ${article.text}
 
-Shu rasmiy maqolaga asoslanib ALKHARAZMIY
-Telegram kanali uchun bitta qiziqarli post yoz.
-`;
+Shu maqolaga asoslanib
+ALKHARAZMIY Telegram kanali uchun
+bitta qiziqarli post yoz.
+`
+        }
+      ],
 
-  const completion = await groq.chat.completions.create({
-    model: "openai/gpt-oss-20b",
-    messages: [
-      {
-        role: "system",
-        content: systemPrompt
-      },
-      {
-        role: "user",
-        content: userPrompt
-      }
-    ],
-    temperature: 0.75,
-    max_tokens: 700
-  });
+      temperature: 0.75,
+      max_tokens: 700
+    });
 
-  return completion.choices[0].message.content.trim();
+  return completion.choices[0]
+    .message
+    .content
+    .trim();
 }
 
 /*
-  Telegram:
-  rasm bor bo'lsa -> sendPhoto
-  rasm bo'lmasa -> sendMessage
+  Telegramga yuborish.
 */
 async function sendTelegram(post, image) {
   const base =
     `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 
   if (image) {
-    const response = await fetch(`${base}/sendPhoto`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: process.env.TELEGRAM_CHANNEL_ID,
-        photo: image,
-        caption: post
-      })
-    });
-
-    const data = await response.json();
-
-    if (!data.ok) {
-      console.error("sendPhoto failed:", data);
-
-      // Rasm ishlamasa, matnni oddiy post qilamiz
-      const fallback = await fetch(`${base}/sendMessage`, {
+    const response =
+      await fetch(`${base}/sendPhoto`, {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json"
         },
+
         body: JSON.stringify({
-          chat_id: process.env.TELEGRAM_CHANNEL_ID,
-          text: post,
-          disable_web_page_preview: false
+          chat_id:
+            process.env.TELEGRAM_CHANNEL_ID,
+
+          photo: image,
+
+          caption: post
         })
       });
 
-      const fallbackData = await fallback.json();
+    const data = await response.json();
 
-      if (!fallbackData.ok) {
-        throw new Error(
-          fallbackData.description || "Telegram error"
-        );
-      }
-
-      return fallbackData;
+    if (data.ok) {
+      return data;
     }
 
-    return data;
+    console.error(
+      "Photo send failed:",
+      data.description
+    );
   }
 
-  const response = await fetch(`${base}/sendMessage`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: process.env.TELEGRAM_CHANNEL_ID,
-      text: post,
-      disable_web_page_preview: false
-    })
-  });
+  /*
+    Rasm ishlamasa post yo'qolib ketmasin.
+  */
+  const response =
+    await fetch(`${base}/sendMessage`, {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json"
+      },
+
+      body: JSON.stringify({
+        chat_id:
+          process.env.TELEGRAM_CHANNEL_ID,
+
+        text: post,
+
+        disable_web_page_preview: false
+      })
+    });
 
   const data = await response.json();
 
   if (!data.ok) {
-    throw new Error(data.description || "Telegram error");
+    throw new Error(
+      data.description || "Telegram error"
+    );
   }
 
   return data;
@@ -352,12 +487,17 @@ async function sendTelegram(post, image) {
 
 export default async function handler(req, res) {
   try {
-    // Cron himoyasi
-    const auth = req.headers.authorization;
+
+    /*
+      Cron himoyasi
+    */
+    const auth =
+      req.headers.authorization;
 
     if (
       process.env.CRON_SECRET &&
-      auth !== `Bearer ${process.env.CRON_SECRET}`
+      auth !==
+        `Bearer ${process.env.CRON_SECRET}`
     ) {
       return res.status(401).json({
         success: false,
@@ -365,62 +505,72 @@ export default async function handler(req, res) {
       });
     }
 
-    // 1. Rasmiy maqolalar linklarini olish
-    const links = await getNewsLinks();
+    /*
+      1. Yangi maqolalarni topamiz
+    */
+    const articles =
+      await getNewArticles();
 
-    if (!links.length) {
-      throw new Error(
-        "Rasmiy yangiliklar topilmadi"
-      );
-    }
-
-    // 2. Har bir maqoladan ma'lumot olish
-    const articles = [];
-
-    for (const link of links.slice(0, 8)) {
-      try {
-        const article = await getNewsArticle(link);
-
-        if (article.title && article.text) {
-          articles.push(article);
-        }
-      } catch (error) {
-        console.error(
-          "Article error:",
-          link,
-          error.message
-        );
-      }
-    }
-
+    /*
+      Agar yangi maqola bo'lmasa,
+      post yaratmaymiz.
+    */
     if (!articles.length) {
-      throw new Error(
-        "Maqolalar o'qilmadi"
-      );
+      return res.status(200).json({
+        success: true,
+        message:
+          "Yangi rasmiy yangilik topilmadi. Post yuborilmadi."
+      });
     }
 
-    // 3. Eng yaxshi yangilikni tanlash
-    const selected = await chooseNews(articles);
+    /*
+      2. Eng yaxshi yangilik
+    */
+    const selected =
+      await chooseNews(articles);
 
-    // 4. AI post yaratish
-    const post = await generatePost(selected);
+    /*
+      3. AI post
+    */
+    const post =
+      await generatePost(selected);
 
-    // 5. Aynan tanlangan maqolaning rasmi
-    const image = selected.image || null;
+    /*
+      4. Telegram
+    */
+    await sendTelegram(
+      post,
+      selected.image
+    );
 
-    // 6. Telegramga yuborish
-    await sendTelegram(post, image);
+    /*
+      5. Supabase'ga saqlash
+    */
+    await savePostedArticle(selected);
 
     return res.status(200).json({
       success: true,
-      message: "Rasmiy yangilik + rasm Telegramga yuborildi!",
-      source: selected.url,
-      title: selected.title,
-      image,
+
+      message:
+        "Yangi rasmiy yangilik + rasm Telegramga yuborildi.",
+
+      source:
+        selected.url,
+
+      title:
+        selected.title,
+
+      date:
+        selected.date,
+
+      image:
+        selected.image,
+
       post
     });
 
   } catch (error) {
+
     console.error(error);
 
     return res.status(500).json({
