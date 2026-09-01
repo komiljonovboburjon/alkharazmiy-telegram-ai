@@ -4,245 +4,434 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
-const NEWS_PAGE = "https://gov.uz/uz/uzbmb/news/view/208834";
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+
+const SOURCES = [
+  "https://gov.uz/oz/uzbmb"
+];
+
+const ALKHARAZMIY_URL = "https://alkharazmiy.xyz";
+
+/* =========================
+   HTML TO TEXT
+========================= */
 
 function cleanText(html) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
+    .replace(/&#x27;/gi, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
 
+/* =========================
+   FETCH
+========================= */
+
 async function fetchPage(url) {
   const response = await fetch(url, {
     headers: {
-      "User-Agent": "Mozilla/5.0 ALKHARAZMIY-AI/1.0"
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
   });
 
   if (!response.ok) {
-    throw new Error(`Source ${response.status}: ${url}`);
+    throw new Error(
+      `HTTP ${response.status}: ${url}`
+    );
   }
 
   return await response.text();
 }
 
-/*
-  gov.uz NEWS PAGE'dan maqola linklarini topish.
-*/
-async function getNewsLinks() {
-  const html = await fetchPage(NEWS_PAGE);
+/* =========================
+   EXTRACT GOV.UZ NEWS LINKS
+========================= */
 
-  const links = [];
+function extractNewsLinks(html) {
+  const links = new Set();
 
-  const regex =
-    /(?:href|url)\s*[:=]\s*["']([^"']*\/(?:oz|uz)\/uzbmb\/news\/view\/\d+)["']/gi;
+  /*
+    1. Oddiy href
+  */
+  const hrefRegex =
+    /href\s*=\s*["']([^"']+)["']/gi;
 
   let match;
 
-  while ((match = regex.exec(html)) !== null) {
-    try {
-      const url = new URL(match[1], NEWS_PAGE).href;
+  while ((match = hrefRegex.exec(html)) !== null) {
+    const value = match[1];
 
-      if (
-        url.includes("/uzbmb/news/view/") &&
-        !links.includes(url)
-      ) {
-        links.push(url);
-      }
-    } catch {}
+    if (
+      value.includes("/oz/uzbmb/news/view/") ||
+      value.includes("/uz/uzbmb/news/view/")
+    ) {
+      try {
+        const url = new URL(
+          value,
+          "https://gov.uz"
+        ).href;
+
+        links.add(url);
+      } catch {}
+    }
   }
 
   /*
-    Agar HTML ichidan topilmasa, qidiruv sahifasidagi
-    ko'rinadigan URL formatlarini boshqa regex bilan tekshiramiz.
+    2. To'liq URL
   */
-  if (!links.length) {
-    const fallbackRegex =
-      /https?:\/\/gov\.uz\/(?:oz|uz)\/uzbmb\/news\/view\/\d+/gi;
+  const fullRegex =
+    /https?:\/\/gov\.uz\/(?:oz|uz)\/uzbmb\/news\/view\/\d+/gi;
 
-    let fallback;
+  while ((match = fullRegex.exec(html)) !== null) {
+    links.add(match[0]);
+  }
 
-    while ((fallback = fallbackRegex.exec(html)) !== null) {
-      if (!links.includes(fallback[0])) {
-        links.push(fallback[0]);
+  /*
+    3. JSON ichidagi escaped URL
+  */
+  const escapedRegex =
+    /(?:https?:\\\/\\\/gov\.uz|\/oz)\\?\/(?:oz\/)?uzbmb\\?\/news\\?\/view\\?\/\d+/gi;
+
+  while ((match = escapedRegex.exec(html)) !== null) {
+    let value = match[0]
+      .replace(/\\\//g, "/");
+
+    if (value.startsWith("/")) {
+      value =
+        "https://gov.uz" + value;
+    }
+
+    links.add(value);
+  }
+
+  return [...links];
+}
+
+/* =========================
+   GET NEWS LINKS
+========================= */
+
+async function getNewsLinks() {
+  const allLinks = new Set();
+
+  for (const source of SOURCES) {
+    try {
+      const html = await fetchPage(source);
+
+      const links =
+        extractNewsLinks(html);
+
+      console.log(
+        `Found ${links.length} links from ${source}`
+      );
+
+      for (const link of links) {
+        allLinks.add(link);
+      }
+
+    } catch (error) {
+      console.error(
+        "Source error:",
+        error.message
+      );
+    }
+  }
+
+  /*
+    Agar bosh sahifadan topilmasa,
+    oldindan ma'lum bo'lgan gov.uz
+    news endpointlarini tekshiramiz.
+  */
+
+  if (!allLinks.size) {
+    console.log(
+      "Main page links not found."
+    );
+
+    /*
+      gov.uz sahifalarining pagination
+      variantlarini tekshirish.
+    */
+
+    const possiblePages = [
+      "https://gov.uz/oz/uzbmb/news",
+      "https://gov.uz/oz/uzbmb/news?page=1",
+      "https://gov.uz/oz/uzbmb/news?page=2",
+      "https://gov.uz/oz/uzbmb/news?page=3"
+    ];
+
+    for (const page of possiblePages) {
+      try {
+        const html =
+          await fetchPage(page);
+
+        const links =
+          extractNewsLinks(html);
+
+        for (const link of links) {
+          allLinks.add(link);
+        }
+
+      } catch (error) {
+        console.error(
+          "Pagination error:",
+          error.message
+        );
       }
     }
   }
 
-  return [...new Set(links)].slice(0, 20);
+  return [...allLinks].slice(0, 30);
 }
 
-/*
-  Maqolaning o'zidan:
-  title
-  date
-  image
-  text
-*/
+/* =========================
+   ARTICLE
+========================= */
+
 async function getNewsArticle(url) {
   const html = await fetchPage(url);
 
+  /* TITLE */
+
   let title = null;
 
-  const titleMatches = [
-    html.match(
-      /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
-    ),
-    html.match(
-      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i
-    ),
-    html.match(
-      /<title[^>]*>([\s\S]*?)<\/title>/i
-    )
+  const titlePatterns = [
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
+
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i,
+
+    /<h1[^>]*>([\s\S]*?)<\/h1>/i,
+
+    /<title[^>]*>([\s\S]*?)<\/title>/i
   ];
 
-  for (const match of titleMatches) {
+  for (const pattern of titlePatterns) {
+    const match =
+      html.match(pattern);
+
     if (match?.[1]) {
-      title = cleanText(match[1]);
-      break;
+      title =
+        cleanText(match[1]);
+
+      if (title) break;
     }
   }
 
+  /* IMAGE */
+
   let image = null;
 
-  const imageMatches = [
-    html.match(
-      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
-    ),
-    html.match(
-      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i
-    ),
-    html.match(
-      /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i
-    )
+  const imagePatterns = [
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i
   ];
 
-  for (const match of imageMatches) {
+  for (const pattern of imagePatterns) {
+    const match =
+      html.match(pattern);
+
     if (match?.[1]) {
       try {
-        image = new URL(match[1], url).href;
+        image =
+          new URL(
+            match[1],
+            url
+          ).href;
+
         break;
       } catch {}
     }
   }
 
+  /* DATE */
+
   let date = null;
 
-  const dateMatches = [
-    html.match(
-      /datetime=["'](202\d-\d\d-\d\d[^"']*)["']/i
-    ),
-    html.match(
-      /(202\d-\d\d-\d\d\s+\d\d:\d\d:\d\d)/
-    )
+  const datePatterns = [
+    /datetime=["']([^"']+)["']/i,
+
+    /(2026-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/i,
+
+    /(2026-\d{2}-\d{2})/i
   ];
 
-  for (const match of dateMatches) {
+  for (const pattern of datePatterns) {
+    const match =
+      html.match(pattern);
+
     if (match?.[1]) {
       date = match[1];
       break;
     }
   }
 
-  const text = cleanText(html);
+  /* TEXT */
+
+  const text =
+    cleanText(html);
 
   return {
     url,
     title,
     date,
     image,
-    text: text.slice(0, 18000)
+    text: text.slice(0, 20000)
   };
 }
 
-/*
-  Supabase'da bu yangilik oldin yuborilganmi?
-*/
-async function isPosted(url) {
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/telegram_posts?source_url=eq.${encodeURIComponent(url)}&select=id`,
-    {
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`
+/* =========================
+   SUPABASE
+========================= */
+
+async function supabaseRequest(
+  endpoint,
+  options = {}
+) {
+  const response =
+    await fetch(
+      `${SUPABASE_URL}/rest/v1/${endpoint}`,
+      {
+        ...options,
+
+        headers: {
+          apikey: SUPABASE_KEY,
+
+          Authorization:
+            `Bearer ${SUPABASE_KEY}`,
+
+          "Content-Type":
+            "application/json",
+
+          ...(options.headers || {})
+        }
       }
-    }
-  );
+    );
 
   if (!response.ok) {
+    const body =
+      await response.text();
+
     throw new Error(
-      `Supabase check error: ${response.status}`
+      `Supabase ${response.status}: ${body}`
     );
   }
 
-  const data = await response.json();
+  return response;
+}
+
+/* =========================
+   CHECK DUPLICATE
+========================= */
+
+async function isPosted(url) {
+  const encoded =
+    encodeURIComponent(url);
+
+  const response =
+    await supabaseRequest(
+      `telegram_posts?source_url=eq.${encoded}&select=id`
+    );
+
+  const data =
+    await response.json();
 
   return data.length > 0;
 }
 
-/*
-  Yuborilgan maqolani Supabase'ga saqlash.
-*/
-async function savePostedArticle(article) {
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/telegram_posts`,
+/* =========================
+   SAVE POST
+========================= */
+
+async function savePost(article) {
+  await supabaseRequest(
+    "telegram_posts",
     {
       method: "POST",
+
       headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        "Content-Type": "application/json",
-        Prefer: "resolution=ignore-duplicates"
+        Prefer:
+          "resolution=ignore-duplicates"
       },
+
       body: JSON.stringify({
-        source_url: article.url,
-        title: article.title,
-        image_url: article.image
+        source_url:
+          article.url,
+
+        title:
+          article.title,
+
+        image_url:
+          article.image
       })
     }
   );
-
-  if (!response.ok) {
-    throw new Error(
-      `Supabase save error: ${response.status} ${await response.text()}`
-    );
-  }
 }
 
-/*
-  Yangi maqolalardan yuborilmaganlarini ajratish.
-*/
-async function getNewArticles() {
-  const links = await getNewsLinks();
+/* =========================
+   GET NEW ARTICLES
+========================= */
 
-  console.log("Found links:", links.length);
+async function getNewArticles() {
+  const links =
+    await getNewsLinks();
+
+  console.log(
+    "TOTAL LINKS:",
+    links.length
+  );
 
   const articles = [];
 
-  for (const link of links.slice(0, 12)) {
+  for (
+    const link of links.slice(0, 15)
+  ) {
     try {
-      const alreadyPosted = await isPosted(link);
+      const posted =
+        await isPosted(link);
 
-      if (alreadyPosted) {
-        console.log("Already posted:", link);
+      if (posted) {
+        console.log(
+          "Already posted:",
+          link
+        );
+
         continue;
       }
 
-      const article = await getNewsArticle(link);
+      const article =
+        await getNewsArticle(link);
 
-      if (article.title && article.text) {
+      if (
+        article.title &&
+        article.text
+      ) {
         articles.push(article);
+
+        console.log(
+          "NEW ARTICLE:",
+          article.title
+        );
       }
 
     } catch (error) {
@@ -257,87 +446,122 @@ async function getNewArticles() {
   return articles;
 }
 
-/*
-  AI eng yaxshi yangilikni tanlaydi.
-*/
-async function chooseNews(articles) {
-  const simplified = articles.map((article, index) => ({
-    index,
-    title: article.title,
-    date: article.date,
-    url: article.url
-  }));
+/* =========================
+   AI SELECT NEWS
+========================= */
+
+async function chooseNews(
+  articles
+) {
+  const simplified =
+    articles.map(
+      (article, index) => ({
+        index,
+        title:
+          article.title,
+
+        date:
+          article.date,
+
+        url:
+          article.url
+      })
+    );
 
   const completion =
     await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
+      model:
+        "openai/gpt-oss-20b",
 
       messages: [
         {
           role: "system",
+
           content: `
 Sen ALKHARAZMIY Telegram kanalining
 yangilik tanlovchisisan.
 
-Berilgan maqolalarning barchasi
-Bilim va malakalarni baholash agentligining
-rasmiy gov.uz manbasidan olingan.
+Barcha maqolalar rasmiy
+gov.uz manbasidan olingan.
 
-Eng foydali BIRTA maqolani tanla.
+Eng foydali BITTA yangilikni tanla.
 
 Ustuvorlik:
 
-1. Eng yangi
-2. Milliy Sertifikat bilan bog'liq
-3. Abituriyentlar uchun muhim
-4. Amaliy foydasi bor
-5. Muhim rasmiy o'zgarish yoki e'lon
+1. Eng yangi yangilik
+2. Milliy Sertifikat
+3. Abituriyentlar uchun foydali
+4. Muhim rasmiy o'zgarish
+5. Imtihon sanasi yoki tartibi
+6. Natijalar
+7. Ruxsatnoma
+8. Ro'yxatdan o'tish
 
-Faqat JSON qaytar:
+Faqat:
 
 {"index": 0}
 
-Boshqa hech narsa yozma.
+formatida javob ber.
 `
         },
+
         {
           role: "user",
-          content: JSON.stringify(simplified)
+
+          content:
+            JSON.stringify(
+              simplified
+            )
         }
       ],
 
       temperature: 0.1,
+
       max_tokens: 50
     });
 
-  const answer =
-    completion.choices[0].message.content.trim();
-
   try {
-    const parsed = JSON.parse(answer);
+    const parsed =
+      JSON.parse(
+        completion
+          .choices[0]
+          .message
+          .content
+          .trim()
+      );
 
     if (
-      typeof parsed.index === "number" &&
+      Number.isInteger(
+        parsed.index
+      ) &&
       articles[parsed.index]
     ) {
-      return articles[parsed.index];
+      return articles[
+        parsed.index
+      ];
     }
+
   } catch {}
 
   return articles[0];
 }
 
-/*
-  Telegram post yaratish.
-*/
-async function generatePost(article) {
+/* =========================
+   GENERATE TELEGRAM POST
+========================= */
+
+async function generatePost(
+  article
+) {
   const completion =
     await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
+      model:
+        "openai/gpt-oss-20b",
 
       messages: [
         {
           role: "system",
+
           content: `
 Sen ALKHARAZMIY Telegram kanalining
 AI kontent menejerisan.
@@ -345,46 +569,44 @@ AI kontent menejerisan.
 ALKHARAZMIY:
 https://alkharazmiy.xyz
 
-ALKHARAZMIY turli fanlar bo'yicha
-Milliy Sertifikat imtihonlariga tayyorgarlik
-uchun online mock test va AI tahlil
-platformasidir.
+ALKHARAZMIY — turli fanlar bo'yicha
+Milliy Sertifikat imtihonlariga
+tayyorgarlik platformasi.
 
-Muhim:
-ALKHARAZMIY faqat matematika platformasi emas.
+Bu faqat matematika platformasi emas.
 
-Vazifang:
-Rasmiy yangilikni Telegram uchun
-qiziqarli va foydali postga aylantirish.
+POST QOIDALARI:
 
-QOIDALAR:
-
-- Faqat berilgan maqoladagi faktlardan foydalan.
-- Hech narsa o'ylab topma.
+- Faqat rasmiy maqoladagi faktlardan foydalan.
+- Fakt o'ylab topma.
 - Sana va raqamlarni o'zgartirma.
-- Maqolada yo'q ma'lumotni qo'shma.
-- Juda uzun yozma.
-- Bitta asosiy mavzuni yorit.
-- Hamma tafsilotni birdaniga berma.
-- O'quvchida qiziqish uyg'ot.
+- Hamma ma'lumotni birdaniga berma.
+- Qiziqish uyg'ot.
+- Bitta asosiy mavzuni tanla.
+- Qisqa va tabiiy yoz.
+- O'zbek tilida yoz.
+- Telegram formatida yoz.
+- Emoji me'yorida.
 - Clickbait ishlatma.
-- Tabiiy o'zbek tilida yoz.
-- Telegram uchun qisqa paragraflardan foydalan.
-- Emoji me'yorida bo'lsin.
 
-ALKHARAZMIY'ni faqat tabiiy joyda eslat.
+Eng muhim ma'lumotni boshida ber.
 
-Agar mos bo'lsa:
+Oxirida o'quvchini
+ALKHARAZMIY saytiga tabiiy ravishda
+yo'naltirish mumkin:
 
-👉 Batafsil:
 https://alkharazmiy.xyz
 
+Lekin har bir postda platformaning
+barcha imkoniyatlarini sanab o'tma.
+
 FAQAT POST MATNINI QAYTAR.
-JSON yoki izoh qaytarma.
 `
         },
+
         {
           role: "user",
+
           content: `
 RASMIY MANBA:
 ${article.url}
@@ -398,99 +620,136 @@ ${article.title}
 MAQOLA:
 ${article.text}
 
-Shu maqolaga asoslanib
+Shu rasmiy maqolaga asoslanib
 ALKHARAZMIY Telegram kanali uchun
-bitta qiziqarli post yoz.
+qiziqarli post yoz.
 `
         }
       ],
 
-      temperature: 0.75,
-      max_tokens: 700
+      temperature:
+        0.75,
+
+      max_tokens:
+        700
     });
 
-  return completion.choices[0]
+  return completion
+    .choices[0]
     .message
     .content
     .trim();
 }
 
-/*
-  Telegramga yuborish.
-*/
-async function sendTelegram(post, image) {
+/* =========================
+   TELEGRAM
+========================= */
+
+async function sendTelegram(
+  post,
+  image
+) {
   const base =
-    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+
+  /*
+    RASM + POST
+  */
 
   if (image) {
     const response =
-      await fetch(`${base}/sendPhoto`, {
-        method: "POST",
+      await fetch(
+        `${base}/sendPhoto`,
+        {
+          method: "POST",
 
-        headers: {
-          "Content-Type": "application/json"
-        },
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
 
-        body: JSON.stringify({
-          chat_id:
-            process.env.TELEGRAM_CHANNEL_ID,
+          body: JSON.stringify({
+            chat_id:
+              CHANNEL_ID,
 
-          photo: image,
+            photo:
+              image,
 
-          caption: post
-        })
-      });
+            caption:
+              post
+          })
+        }
+      );
 
-    const data = await response.json();
+    const data =
+      await response.json();
 
     if (data.ok) {
       return data;
     }
 
     console.error(
-      "Photo send failed:",
-      data.description
+      "sendPhoto error:",
+      data
     );
   }
 
   /*
-    Rasm ishlamasa post yo'qolib ketmasin.
+    Agar rasm ishlamasa,
+    post baribir yuboriladi.
   */
+
   const response =
-    await fetch(`${base}/sendMessage`, {
-      method: "POST",
+    await fetch(
+      `${base}/sendMessage`,
+      {
+        method: "POST",
 
-      headers: {
-        "Content-Type": "application/json"
-      },
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
 
-      body: JSON.stringify({
-        chat_id:
-          process.env.TELEGRAM_CHANNEL_ID,
+        body: JSON.stringify({
+          chat_id:
+            CHANNEL_ID,
 
-        text: post,
+          text:
+            post,
 
-        disable_web_page_preview: false
-      })
-    });
+          disable_web_page_preview:
+            false
+        })
+      }
+    );
 
-  const data = await response.json();
+  const data =
+    await response.json();
 
   if (!data.ok) {
     throw new Error(
-      data.description || "Telegram error"
+      data.description ||
+      "Telegram error"
     );
   }
 
   return data;
 }
 
-export default async function handler(req, res) {
+/* =========================
+   MAIN
+========================= */
+
+export default async function handler(
+  req,
+  res
+) {
   try {
 
     /*
-      Cron himoyasi
+      CRON SECURITY
     */
+
     const auth =
       req.headers.authorization;
 
@@ -501,58 +760,79 @@ export default async function handler(req, res) {
     ) {
       return res.status(401).json({
         success: false,
-        error: "Unauthorized"
+
+        error:
+          "Unauthorized"
       });
     }
 
     /*
-      1. Yangi maqolalarni topamiz
+      1. NEW ARTICLES
     */
+
     const articles =
       await getNewArticles();
 
     /*
-      Agar yangi maqola bo'lmasa,
-      post yaratmaymiz.
+      2. NOTHING NEW
     */
+
     if (!articles.length) {
       return res.status(200).json({
         success: true,
+
         message:
-          "Yangi rasmiy yangilik topilmadi. Post yuborilmadi."
+          "Yangi rasmiy yangilik topilmadi. Post yuborilmadi.",
+
+        checked:
+          true
       });
     }
 
     /*
-      2. Eng yaxshi yangilik
+      3. SELECT
     */
+
     const selected =
-      await chooseNews(articles);
+      await chooseNews(
+        articles
+      );
 
     /*
-      3. AI post
+      4. AI POST
     */
+
     const post =
-      await generatePost(selected);
+      await generatePost(
+        selected
+      );
 
     /*
-      4. Telegram
+      5. TELEGRAM
     */
+
     await sendTelegram(
       post,
       selected.image
     );
 
     /*
-      5. Supabase'ga saqlash
+      6. SUPABASE
     */
-    await savePostedArticle(selected);
+
+    await savePost(
+      selected
+    );
+
+    /*
+      7. RESULT
+    */
 
     return res.status(200).json({
       success: true,
 
       message:
-        "Yangi rasmiy yangilik + rasm Telegramga yuborildi.",
+        "Rasmiy yangilik + rasm Telegramga yuborildi!",
 
       source:
         selected.url,
@@ -571,11 +851,16 @@ export default async function handler(req, res) {
 
   } catch (error) {
 
-    console.error(error);
+    console.error(
+      "CRON ERROR:",
+      error
+    );
 
     return res.status(500).json({
       success: false,
-      error: error.message
+
+      error:
+        error.message
     });
   }
 }
