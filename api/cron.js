@@ -8,6 +8,24 @@ const SEARCH_TOPICS = [
   "Milliy sertifikat natijalari",
   "Milliy sertifikat sanalari",
   "UZBMB",
+  "DTM",
+  "ta'lim yangiliklari",
+  "abituriyent",
+  "OTM",
+  "kirish imtihonlari",
+  "maktab ta'limi",
+  "fan olimpiadalari",
+  "matematika",
+  "tarix",
+  "ona tili",
+  "fizika",
+  "biologiya",
+  "kimyo",
+  "chet tili",
+  "CEFR",
+  "IELTS",
+  "National Certificate",
+  "education Uzbekistan"
   "Bilim va malakalarni baholash agentligi",
   "DTM O'zbekiston",
   "DTM test",
@@ -91,6 +109,7 @@ export function cleanText(html) {
   return decodeHtmlEntities(cleaned);
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
 export function normalizeUrl(rawUrl) {
   if (!rawUrl) return "";
   try {
@@ -118,11 +137,19 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const response = await fetch(url, {
     const res = await fetch(url, {
       ...options,
       signal: controller.signal,
       headers: {
         "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ...(options.headers || {})
+      }
+    });
+    return response;
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         ...(options.headers || {})
@@ -134,6 +161,126 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   }
 }
 
+async function fetchGoogleNewsRss(query) {
+  const encodedQuery = encodeURIComponent(query);
+  const rssUrl = `https://news.google.com/rss/search?q=${encodedQuery}&hl=uz&gl=UZ&ceid=UZ:uz`;
+
+  try {
+    const res = await fetchWithTimeout(rssUrl, {}, 8000);
+    if (!res.ok) return [];
+    const xml = await res.text();
+
+    const items = [];
+    const itemMatches = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
+
+    for (const match of itemMatches) {
+      const itemXml = match[1];
+      const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/i);
+      const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/i);
+      const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+
+      if (titleMatch && linkMatch) {
+        items.push({
+          title: cleanText(titleMatch[1]),
+          link: linkMatch[1].trim(),
+          pubDate: pubDateMatch ? pubDateMatch[1].trim() : null
+        });
+      }
+    }
+    return items;
+  } catch (err) {
+    console.error("RSS Fetch Error:", query, err.message);
+    return [];
+  }
+}
+
+export async function resolveGoogleNewsUrl(gnewsUrl) {
+  try {
+    const res = await fetchWithTimeout(gnewsUrl, {}, 8000);
+    if (!res.ok) return gnewsUrl;
+    const html = await res.text();
+
+    const cwMatch = html.match(/<c-wiz[^>]+data-p=["']([^"']+)["']/i);
+    if (!cwMatch) return gnewsUrl;
+
+    let rawStr = cwMatch[1].replace(/&quot;/g, '"');
+    if (rawStr.startsWith("%.@.")) rawStr = rawStr.slice(4);
+
+    let dataP;
+    try {
+      dataP = JSON.parse(rawStr);
+    } catch {
+      return gnewsUrl;
+    }
+
+    const payload = [
+      [
+        "FbvS2b",
+        JSON.stringify(dataP),
+        null,
+        "generic"
+      ]
+    ];
+
+    const body = new URLSearchParams();
+    body.append("f.req", JSON.stringify([payload]));
+
+    const batchRes = await fetchWithTimeout("https://news.google.com/_/DotsDataUi/data/batchexecute?rpcids=FbvS2b", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"
+      },
+      body: body.toString()
+    }, 8000);
+
+    const batchText = await batchRes.text();
+    let cleanedText = batchText;
+    if (cleanedText.startsWith(")]}'")) {
+      cleanedText = cleanedText.substring(4).trim();
+    }
+
+    const outer = JSON.parse(cleanedText);
+    for (const item of outer) {
+      if (item[0] === "wrb.fr" && item[1] === "FbvS2b") {
+        const innerObj = JSON.parse(item[2]);
+        if (innerObj && innerObj[1]) {
+          return innerObj[1];
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Google News redirect decoder error:", e.message);
+  }
+  return gnewsUrl;
+}
+
+async function scrapeOfficialGovUz() {
+  const urls = [
+    "https://gov.uz/oz/uzbmb/news/news",
+    "https://gov.uz/uz/uzbmb/news/news",
+    "https://gov.uz/oz/uzbmb",
+    "https://gov.uz/uz/uzbmb"
+  ];
+
+  const foundLinks = new Set();
+
+  for (const pageUrl of urls) {
+    try {
+      const res = await fetchWithTimeout(pageUrl, {}, 8000);
+      if (!res.ok) continue;
+      const html = await res.text();
+
+      const patterns = [
+        /\/news\/view\/(\d+)/gi,
+        /news\\\/view\\\/(\d+)/gi,
+        /news%2Fview%2F(\d+)/gi
+      ];
+
+      for (const pat of patterns) {
+        let m;
+        while ((m = pat.exec(html)) !== null) {
+          foundLinks.add(`https://gov.uz/oz/uzbmb/news/view/${m[1]}`);
+        }
 /**
  * Resolves Google News redirect URL to original source URL using batchexecute API.
  */
@@ -322,8 +469,19 @@ export async function scrapeOriginalArticle(pageUrl, fallbackDate = null) {
         date = match[1];
         break;
       }
+    } catch (err) {
+      console.error("Gov.uz scrape error:", pageUrl, err.message);
     }
 
+  // Candidate ID probing for latest official articles
+  const probeHighs = [211000, 210877, 208834];
+  for (const startId of probeHighs) {
+    for (let offset = 0; offset < 30; offset++) {
+      const candidateId = startId - offset;
+      if (candidateId > 0) {
+        foundLinks.add(`https://gov.uz/oz/uzbmb/news/view/${candidateId}`);
+      }
+    }
     // 5. Main text
     const text = cleanText(html);
     if (!text || text.length < 50) return null;
@@ -350,6 +508,106 @@ export async function scrapeOriginalArticle(pageUrl, fallbackDate = null) {
   }
 }
 
+  return [...foundLinks];
+}
+
+async function fetchArticleDetails(targetUrl) {
+  try {
+    const res = await fetchWithTimeout(targetUrl, {}, 10000);
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    let title = null;
+    const titlePatterns = [
+      /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i,
+      /<h1[^>]*>([\s\S]*?)<\/h1>/i,
+      /<title[^>]*>([\s\S]*?)<\/title>/i
+    ];
+
+    for (const pat of titlePatterns) {
+      const m = html.match(pat);
+      if (m && m[1]) {
+        const extracted = cleanText(m[1]);
+        if (extracted && !AGENCY_DEFAULT_TITLES.includes(extracted)) {
+          title = extracted;
+          break;
+        }
+      }
+    }
+
+    if (!title) return null;
+
+    let image = null;
+    const imagePatterns = [
+      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+      /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+      /<meta[^>]+itemprop=["']image["'][^>]+content=["']([^"']+)["']/i
+    ];
+
+    for (const pat of imagePatterns) {
+      const m = html.match(pat);
+      if (m && m[1]) {
+        try {
+          const rawImg = decodeHtmlEntities(m[1].trim());
+          if (
+            !rawImg.includes("google.com") &&
+            !rawImg.includes("gstatic.com") &&
+            !rawImg.includes("logo") &&
+            !rawImg.endsWith(".ico")
+          ) {
+            image = new URL(rawImg, targetUrl).href;
+            break;
+          }
+        } catch {
+          image = null;
+        }
+      }
+    }
+
+    let canonicalUrl = targetUrl;
+    const canonicalMatch = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
+    if (canonicalMatch && canonicalMatch[1]) {
+      try {
+        canonicalUrl = new URL(decodeHtmlEntities(canonicalMatch[1].trim()), targetUrl).href;
+      } catch {
+        canonicalUrl = targetUrl;
+      }
+    }
+
+    let date = null;
+    const datePatterns = [
+      /"date"\s*:\s*"([^"]+)"/i,
+      /datetime=["']([^"']+)["']/i,
+      /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/,
+      /(\d{4}-\d{2}-\d{2})/,
+      /(\d{2}\.\d{2}\.\d{4})/
+    ];
+
+    for (const pat of datePatterns) {
+      const m = html.match(pat);
+      if (m && m[1]) {
+        date = m[1];
+        break;
+      }
+    }
+
+    const text = cleanText(html);
+
+    return {
+      url: canonicalUrl || targetUrl,
+      originalUrl: targetUrl,
+      title,
+      date,
+      image,
+      text: text.slice(0, 15000)
+    };
+  } catch (err) {
+    console.error("Article fetch error:", targetUrl, err.message);
+    return null;
+  }
 /**
  * Fetches Google News RSS items for a topic.
  */
@@ -523,6 +781,57 @@ export async function savePost(article) {
   });
 }
 
+async function discoverAllNews() {
+  const candidateUrls = new Set();
+
+  // 1. Official UZBMB GOV.UZ source discovery
+  const officialLinks = await scrapeOfficialGovUz();
+  for (const link of officialLinks) {
+    candidateUrls.add(link);
+  }
+
+  // 2. Internet-wide Google News RSS feeds discovery
+  const shuffledTopics = [...SEARCH_TOPICS].sort(() => 0.5 - Math.random()).slice(0, 5);
+
+  for (const topic of shuffledTopics) {
+    const items = await fetchGoogleNewsRss(topic);
+    for (const item of items) {
+      if (item.link) {
+        candidateUrls.add(item.link);
+      }
+    }
+  }
+
+  console.log("TOTAL DISCOVERED CANDIDATE LINKS:", candidateUrls.size);
+
+  const candidateArticles = [];
+
+  for (const link of candidateUrls) {
+    if (candidateArticles.length >= 15) break;
+
+    try {
+      let targetUrl = link;
+
+      if (link.includes("news.google.com")) {
+        targetUrl = await resolveGoogleNewsUrl(link);
+      }
+
+      if (await isPosted(targetUrl)) {
+        console.log("Already posted:", targetUrl);
+        continue;
+      }
+
+      const details = await fetchArticleDetails(targetUrl);
+      if (details && details.title && details.text && details.text.length > 150) {
+        candidateArticles.push(details);
+        console.log("NEW DISCOVERED ARTICLE:", details.title, "->", details.url);
+      }
+    } catch (err) {
+      console.error("Candidate processing error:", link, err.message);
+    }
+  }
+
+  return candidateArticles;
 /**
  * Helper to check date age in days (allow up to 7 days max).
  */
@@ -637,6 +946,8 @@ export async function chooseNews(articles, groqClient) {
     title: article.title,
     date: article.date,
     url: article.url,
+    hasImage: Boolean(article.image),
+    isOfficialGovUz: article.url.includes("gov.uz")
     snippet: article.text.slice(0, 300)
   }));
 
@@ -646,6 +957,19 @@ export async function chooseNews(articles, groqClient) {
       messages: [
         {
           role: "system",
+          content: `Sen ALKHARAZMIY Telegram kanali uchun eng muhim va dolzarb ta'lim hamda Milliy Sertifikat yangiligini tanlovchi AI kontent ekspertisan.
+
+Nomzodlar ro'yxatidan BITTA eng foydali va qiziqarli yangilikni tanla.
+
+USTUVORLIK QOIDALARI:
+1. Rasmiy UZBMB / Bilim va malakalarni baholash agentligi yangiliklari
+2. Milliy sertifikat imtihon sanalari, ro'yxatdan o'tish, ruxsatnomalar, natijalar
+3. Muhim ta'lim va abituriyent yangiliklari (OTM, maktab, olimpiadalar, CEFR, IELTS)
+4. Yangilikning yangiligi va rasm mavjudligi
+
+Faqat JSON qaytar:
+{"index":0}
+Boshqa hech narsa yozma.`
           content: `Sen ALKHARAZMIY Telegram kanalining rasmiy yangilik tanlovchisisan.
 Quyida internet va rasmiy manbalardan topilgan so'nggi ta'limiy va milliy sertifikat yangiliklari berilgan.
 BITTA eng muhim, dolzarb va foydali yangilikni tanla.
@@ -683,6 +1007,50 @@ Boshqa hech qanday izoh va matn yozma.`
   return articles[0];
 }
 
+async function generatePost(article) {
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "openai/gpt-oss-20b",
+      messages: [
+        {
+          role: "system",
+          content: `Sen ALKHARAZMIY Telegram kanalining AI kontent menejerisan.
+
+ALKHARAZMIY: ${ALKHARAZMIY_URL}
+ALKHARAZMIY — turli fanlar bo'yicha Milliy Sertifikat hamda imtihonlarga tayyorlanish platformasi.
+Bu faqat matematika platformasi emas!
+
+POST QOIDALARI:
+- Faqat berilgan maqoladagi haqiqiy faktlardan foydalan.
+- Fakt o'ylab topma (hallucination yo'q).
+- Sana, vaqt va raqamlarni o'zgartirma.
+- O'zbek tilida tabiiy, qiziqarli va ravon yoz.
+- O'quvchilarga nima uchun bu yangilik muhimligini tushuntir va qiziqish uyg'ot.
+- Matn oxirida ALKHARAZMIY saytiga (${ALKHARAZMIY_URL}) va manba havolasiga (${article.url}) tabiiy ravishda havola ber.
+- Telegram HTML formatidan foydalan (<b>bold</b>, <i>italic</i>, <a href="...">link</a>).
+- Raw markdown (**bold**) ISHLATMA.
+
+FAQAT POST MATNINI QAYTAR.`
+        },
+        {
+          role: "user",
+          content: `MANBA URL: ${article.url}
+SANA: ${article.date || "Noma'lum"}
+SARLAVHA: ${article.title}
+MAQOLA MATNI: ${article.text}
+
+Shu maqola asosida ALKHARAZMIY Telegram kanali uchun bitta ajoyib post yoz.`
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 700
+    });
+
+    return completion.choices[0]?.message?.content?.trim() || escapeHtml(article.title);
+  } catch (err) {
+    console.error("Groq generate post error:", err.message);
+    return `<b>${escapeHtml(article.title)}</b>\n\nBatafsil ma'lumot: <a href="${article.url}">${escapeHtml(article.title)}</a>\n\nTayyorgarlik: <a href="${ALKHARAZMIY_URL}">ALKHARAZMIY</a>`;
+  }
 /**
  * Generate a short, natural Uzbek Telegram post using Groq AI
  */
@@ -730,7 +1098,11 @@ Ushbu manba asosida Telegram kanali uchun sifatli Uzbek post yarat. Agar ma'lumo
 
 export function truncateCaption(caption, maxLen = 1024) {
   if (!caption || caption.length <= maxLen) return caption;
-  const truncated = caption.slice(0, maxLen - 4);
+  // Strip tags first for photo caption truncation to avoid leaving broken unclosed HTML tags
+  const plain = caption.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  if (plain.length <= maxLen) return plain;
+
+  const truncated = plain.slice(0, maxLen - 4);
   const lastSpace = truncated.lastIndexOf(" ");
   if (lastSpace > maxLen - 120) {
     return truncated.slice(0, lastSpace) + "...";
@@ -795,6 +1167,10 @@ export default async function handler(req, res) {
   try {
     console.log("ALKHARAZMIY CRON TRIGGERED:", new Date().toISOString());
 
+    const articles = await discoverAllNews();
+
+    if (!articles.length) {
+      console.log("CRON RESULT: Yangi rasmiy/internet yangilik topilmadi.");
     const CRON_SECRET = process.env.CRON_SECRET;
 
     if (CRON_SECRET) {
