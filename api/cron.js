@@ -2,6 +2,34 @@ import Groq from "groq-sdk";
 
 const ALKHARAZMIY_URL = "https://alkharazmiy.xyz";
 
+const SEARCH_TOPICS = [
+  "Milliy sertifikat",
+  "Milliy sertifikat imtihonlari",
+  "Milliy sertifikat natijalari",
+  "Milliy sertifikat sanalari",
+  "UZBMB",
+  "Bilim va malakalarni baholash agentligi",
+  "DTM O'zbekiston",
+  "DTM test",
+  "ta'lim yangiliklari O'zbekiston",
+  "abituriyent yangiliklari",
+  "OTMga kirish",
+  "OTM qabul",
+  "kirish imtihonlari O'zbekiston",
+  "maktab ta'limi O'zbekiston",
+  "fan olimpiadalari O'zbekiston",
+  "matematika sertifikat",
+  "tarix sertifikat",
+  "ona tili sertifikat",
+  "fizika sertifikat",
+  "biologiya sertifikat",
+  "kimyo sertifikat",
+  "chet tili CEFR",
+  "IELTS O'zbekiston",
+  "National Certificate Uzbekistan",
+  "education Uzbekistan news"
+];
+
 const GOV_PAGES = [
   "https://gov.uz/oz/uzbmb/news/news",
   "https://gov.uz/uz/uzbmb/news/news",
@@ -25,7 +53,7 @@ const POST_STYLES = [
   "E. Muhim eslatma va savol-javob shakli"
 ];
 
-function decodeHtmlEntities(str) {
+export function decodeHtmlEntities(str) {
   if (!str) return "";
   return str
     .replace(/&#x27;/gi, "'")
@@ -34,7 +62,9 @@ function decodeHtmlEntities(str) {
     .replace(/&amp;/gi, "&")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
-    .replace(/&nbsp;/gi, " ");
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec))
+    .replace(/&#x([0-9a-f]+);/gi, (match, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
 export function escapeHtml(str) {
@@ -45,25 +75,37 @@ export function escapeHtml(str) {
     .replace(/>/g, "&gt;");
 }
 
-function cleanText(html) {
+export function cleanText(html) {
   if (!html) return "";
   const cleaned = html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
     .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   return decodeHtmlEntities(cleaned);
 }
 
-function normalizeUrl(rawUrl) {
+export function normalizeUrl(rawUrl) {
   if (!rawUrl) return "";
   try {
     const urlObj = new URL(rawUrl);
     urlObj.hash = "";
+    const keysToKeep = [];
+    for (const [key, value] of [...urlObj.searchParams.entries()]) {
+      if (!key.startsWith("utm_") && !key.startsWith("fbclid") && key !== "oc") {
+        keysToKeep.push([key, value]);
+      }
+    }
     urlObj.search = "";
+    for (const [k, v] of keysToKeep) {
+      urlObj.searchParams.append(k, v);
+    }
     let str = urlObj.toString();
     if (str.endsWith("/")) str = str.slice(0, -1);
     return str;
@@ -72,201 +114,302 @@ function normalizeUrl(rawUrl) {
   }
 }
 
-async function fetchPage(url, timeoutMs = 12000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
-    const response = await fetch(url, {
+    const res = await fetch(url, {
+      ...options,
       signal: controller.signal,
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ...(options.headers || {})
       }
     });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${url}`);
-    }
-
-    return await response.text();
+    return res;
   } finally {
     clearTimeout(timer);
   }
 }
 
-function extractNewsIdsFromText(text) {
-  const ids = new Set();
-  const patterns = [
-    /\/news\/view\/(\d+)/gi,
-    /news\\\/view\\\/(\d+)/gi,
-    /news%2Fview%2F(\d+)/gi,
-    /\b(21\d{4})\b/g,
-    /\b(20\d{4})\b/g
-  ];
+/**
+ * Resolves Google News redirect URL to original source URL using batchexecute API.
+ */
+export async function resolveGoogleNewsUrl(googleNewsUrl) {
+  try {
+    const match = googleNewsUrl.match(/articles\/([^?]+)/);
+    if (!match) return googleNewsUrl;
+    const base64Str = match[1];
 
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      if (match[1]) ids.add(match[1]);
+    let pageRes = await fetchWithTimeout(`https://news.google.com/articles/${base64Str}`, {}, 7000);
+    if (!pageRes.ok) {
+      pageRes = await fetchWithTimeout(`https://news.google.com/rss/articles/${base64Str}`, {}, 7000);
     }
-  }
 
-  return [...ids];
+    if (!pageRes.ok) return null;
+
+    const html = await pageRes.text();
+    const sgMatch = html.match(/data-n-a-sg="([^"]+)"/);
+    const tsMatch = html.match(/data-n-a-ts="([^"]+)"/);
+
+    if (!sgMatch || !tsMatch) return null;
+
+    const signature = sgMatch[1];
+    const timestamp = tsMatch[1];
+
+    const payload = [
+      "Fbv4je",
+      `["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"${base64Str}",${timestamp},"${signature}"]`
+    ];
+
+    const batchRes = await fetchWithTimeout(
+      "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"
+        },
+        body: `f.req=${encodeURIComponent(JSON.stringify([[payload]]))}`
+      },
+      7000
+    );
+
+    if (!batchRes.ok) return null;
+
+    const batchText = await batchRes.text();
+    const parsedData = JSON.parse(batchText.split("\n\n")[1]).slice(0, -2);
+    const decodedUrl = JSON.parse(parsedData[0][2])[1];
+    return decodedUrl;
+  } catch (err) {
+    console.warn("Google News URL resolution failed for:", googleNewsUrl, err.message);
+    return null;
+  }
 }
 
-async function probeRecentArticleIds() {
-  const probedIds = new Set();
-  const knownHighs = [214451, 213680, 213670, 212746, 210877, 208834];
-
-  for (const startId of knownHighs) {
-    for (let offset = 0; offset <= 25; offset++) {
-      const candidateId = startId - offset;
-      if (candidateId > 0) probedIds.add(String(candidateId));
-    }
+function isGoogleOrInvalidImage(imgUrl) {
+  if (!imgUrl) return true;
+  const lower = imgUrl.toLowerCase();
+  if (
+    lower.includes("google") ||
+    lower.includes("gstatic") ||
+    lower.includes("googleusercontent") ||
+    lower.includes("favicon") ||
+    lower.includes("logo") ||
+    lower.includes("avatar") ||
+    lower.includes("icon") ||
+    lower.endsWith(".svg")
+  ) {
+    return true;
   }
-
-  return [...probedIds];
+  return false;
 }
 
-async function getGovUzArticles() {
-  const candidateIds = new Set();
+/**
+ * Scrapes original article HTML page to extract canonical URL, title, date, main text, and original image.
+ */
+export async function scrapeOriginalArticle(pageUrl, fallbackDate = null) {
+  try {
+    const res = await fetchWithTimeout(pageUrl, {}, 10000);
+    if (!res.ok) return null;
 
-  for (const pageUrl of GOV_PAGES) {
-    try {
-      const html = await fetchPage(pageUrl);
-      const ids = extractNewsIdsFromText(html);
-      for (const id of ids) candidateIds.add(id);
-    } catch (error) {
-      console.error("GOV.UZ SCRAPE ERROR:", pageUrl, error.message);
-    }
-  }
+    const html = await res.text();
 
-  const probed = await probeRecentArticleIds();
-  for (const id of probed) candidateIds.add(id);
-
-  console.log("TOTAL GOV.UZ CANDIDATE IDs:", candidateIds.size);
-
-  const articles = [];
-  const sortedIds = [...candidateIds].sort((a, b) => Number(b) - Number(a));
-
-  for (const id of sortedIds) {
-    if (articles.length >= 8) break;
-    const url = `https://gov.uz/oz/uzbmb/news/view/${id}`;
-    const normalized = normalizeUrl(url);
-
-    try {
-      if (await isPosted(normalized)) {
-        console.log("Already posted GOV article:", normalized);
-        continue;
-      }
-
-      const article = await getGovArticle(url);
-      if (article && article.title && article.text && article.text.length > 50) {
-        articles.push(article);
-        console.log("NEW VALID GOV ARTICLE:", article.title);
-      }
-    } catch (error) {
-      console.error("GOV ARTICLE FETCH ERROR:", url, error.message);
-    }
-  }
-
-  return articles;
-}
-
-async function getGovArticle(url) {
-  const html = await fetchPage(url);
-
-  let title = null;
-  const titlePatterns = [
-    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i,
-    /<h1[^>]*>([\s\S]*?)<\/h1>/i,
-    /<title[^>]*>([\s\S]*?)<\/title>/i
-  ];
-
-  for (const pattern of titlePatterns) {
-    const match = html.match(pattern);
-    if (match && match[1]) {
-      const extracted = cleanText(match[1]);
-      if (extracted && !AGENCY_DEFAULT_TITLES.includes(extracted)) {
-        title = extracted;
-        break;
-      }
-    }
-  }
-
-  if (!title) return null;
-
-  let image = null;
-  const imagePatterns = [
-    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
-    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i
-  ];
-
-  for (const pattern of imagePatterns) {
-    const match = html.match(pattern);
-    if (match && match[1]) {
+    // 1. Canonical URL
+    let canonicalUrl = normalizeUrl(pageUrl);
+    const canonicalMatch =
+      html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i) ||
+      html.match(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i);
+    if (canonicalMatch && canonicalMatch[1]) {
       try {
-        const rawImg = decodeHtmlEntities(match[1].trim());
-        image = new URL(rawImg, url).href;
-        break;
-      } catch {
-        image = null;
+        const resolved = new URL(canonicalMatch[1], pageUrl).href;
+        canonicalUrl = normalizeUrl(resolved);
+      } catch {}
+    }
+
+    // 2. Title
+    let title = null;
+    const titlePatterns = [
+      /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i,
+      /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["']/i,
+      /<h1[^>]*>([\s\S]*?)<\/h1>/i,
+      /<title[^>]*>([\s\S]*?)<\/title>/i
+    ];
+
+    for (const pattern of titlePatterns) {
+      const match = html.match(pattern);
+      if (match && match[1]) {
+        const extracted = cleanText(match[1]);
+        if (extracted && !AGENCY_DEFAULT_TITLES.includes(extracted)) {
+          title = extracted;
+          break;
+        }
       }
     }
-  }
 
-  let date = null;
-  const datePatterns = [
-    /"date"\s*:\s*"([^"]+)"/i,
-    /datetime=["']([^"']+)["']/i,
-    /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/,
-    /(\d{4}-\d{2}-\d{2})/,
-    /(\d{2}\.\d{2}\.\d{4})/
-  ];
+    if (!title) return null;
 
-  for (const pattern of datePatterns) {
-    const match = html.match(pattern);
-    if (match && match[1]) {
-      date = match[1];
-      break;
+    // 3. Image
+    let image = null;
+
+    const imagePatterns = [
+      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+      /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i
+    ];
+
+    for (const pattern of imagePatterns) {
+      const match = html.match(pattern);
+      if (match && match[1]) {
+        try {
+          const rawImg = decodeHtmlEntities(match[1].trim());
+          const absImg = new URL(rawImg, pageUrl).href;
+          if (!isGoogleOrInvalidImage(absImg)) {
+            image = absImg;
+            break;
+          }
+        } catch {}
+      }
     }
+
+    if (!image) {
+      const jsonLdMatches = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+      for (const m of jsonLdMatches) {
+        try {
+          const jsonLd = JSON.parse(m[1].trim());
+          const extractImgFromJson = (obj) => {
+            if (!obj) return null;
+            if (typeof obj === "string" && !isGoogleOrInvalidImage(obj)) return obj;
+            if (Array.isArray(obj)) {
+              for (const item of obj) {
+                const found = extractImgFromJson(item);
+                if (found) return found;
+              }
+            } else if (typeof obj === "object") {
+              if (obj.url && typeof obj.url === "string" && !isGoogleOrInvalidImage(obj.url)) return obj.url;
+              if (obj.image) return extractImgFromJson(obj.image);
+            }
+            return null;
+          };
+          const ldImg = extractImgFromJson(jsonLd);
+          if (ldImg) {
+            image = new URL(ldImg, pageUrl).href;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // 4. Date
+    let date = fallbackDate;
+    const datePatterns = [
+      /<meta[^>]+property=["']article:published_time["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']article:published_time["']/i,
+      /<meta[^>]+name=["']pubdate["'][^>]+content=["']([^"']+)["']/i,
+      /"datePublished"\s*:\s*"([^"]+)"/i,
+      /datetime=["']([^"']+)["']/i,
+      /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/i,
+      /(\d{4}-\d{2}-\d{2})/
+    ];
+
+    for (const pattern of datePatterns) {
+      const match = html.match(pattern);
+      if (match && match[1]) {
+        date = match[1];
+        break;
+      }
+    }
+
+    // 5. Main text
+    const text = cleanText(html);
+    if (!text || text.length < 50) return null;
+
+    let sourceDomain = "";
+    try {
+      sourceDomain = new URL(canonicalUrl).hostname.replace(/^www\./, "");
+    } catch {
+      sourceDomain = pageUrl;
+    }
+
+    return {
+      url: canonicalUrl,
+      raw_url: pageUrl,
+      source: sourceDomain,
+      title,
+      date,
+      image,
+      text: text.slice(0, 15000)
+    };
+  } catch (err) {
+    console.warn("Error scraping original article:", pageUrl, err.message);
+    return null;
   }
-
-  const text = cleanText(html);
-
-  return {
-    url: normalizeUrl(url),
-    raw_url: url,
-    source: "UZBMB Official Website (gov.uz)",
-    title,
-    date,
-    image,
-    text: text.slice(0, 15000)
-  };
 }
 
+/**
+ * Fetches Google News RSS items for a topic.
+ */
+async function fetchGoogleNewsRss(topic) {
+  const items = [];
+  try {
+    const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(topic)}&hl=uz&gl=UZ&ceid=UZ:uz`;
+    const response = await fetchWithTimeout(rssUrl, {}, 8000);
+    if (!response.ok) return items;
+
+    const xml = await response.text();
+    const itemMatches = xml.matchAll(/<item>([\s\S]*?)<\/item>/g);
+
+    for (const m of itemMatches) {
+      const itemXml = m[1];
+      const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/);
+      const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/);
+      const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
+
+      if (titleMatch && linkMatch) {
+        const rawTitle = titleMatch[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+        const googleLink = linkMatch[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+        const pubDateStr = pubDateMatch ? pubDateMatch[1].trim() : null;
+
+        items.push({
+          rawTitle: decodeHtmlEntities(rawTitle),
+          googleLink,
+          pubDateStr,
+          topic
+        });
+      }
+    }
+  } catch (err) {
+    console.warn(`Error fetching RSS for topic "${topic}":`, err.message);
+  }
+  return items;
+}
+
+/**
+ * Scraping supplementary Telegram Channels (e.g. @BaholashUz, @eduuz)
+ */
 async function getTelegramChannelArticles(channelUsername) {
   const webUrl = `https://t.me/s/${channelUsername}`;
   const articles = [];
 
   try {
-    const html = await fetchPage(webUrl);
+    const res = await fetchWithTimeout(webUrl, {}, 8000);
+    if (!res.ok) return articles;
+
+    const html = await res.text();
     const messages = html.split('<div class="tgme_widget_message ');
 
     for (let i = messages.length - 1; i >= 1; i--) {
       if (articles.length >= 5) break;
 
       const msgBlock = messages[i];
-
       const linkMatch = msgBlock.match(/href="(https:\/\/t\.me\/[^\/]+\/\d+)"/);
       if (!linkMatch) continue;
 
       const postUrl = normalizeUrl(linkMatch[1]);
-      if (await isPosted(postUrl)) continue;
 
       const timeMatch = msgBlock.match(/<time[^>]+datetime="([^"]+)"/);
       const date = timeMatch ? timeMatch[1] : null;
@@ -302,12 +445,15 @@ async function getTelegramChannelArticles(channelUsername) {
       });
     }
   } catch (error) {
-    console.error(`TELEGRAM SCRAPE ERROR (@${channelUsername}):`, error.message);
+    console.warn(`TELEGRAM SCRAPE ERROR (@${channelUsername}):`, error.message);
   }
 
   return articles;
 }
 
+/**
+ * Supabase helper
+ */
 async function supabaseRequest(endpoint, options = {}, retry = true) {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -336,14 +482,14 @@ async function supabaseRequest(endpoint, options = {}, retry = true) {
     return response;
   } catch (error) {
     if (retry) {
-      console.error("SUPABASE RETRY:", endpoint, error.message);
+      console.warn("SUPABASE RETRY:", endpoint, error.message);
       return supabaseRequest(endpoint, options, false);
     }
     throw error;
   }
 }
 
-async function isPosted(url) {
+export async function isPosted(url) {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -358,7 +504,7 @@ async function isPosted(url) {
   return Array.isArray(data) && data.length > 0;
 }
 
-async function savePost(article) {
+export async function savePost(article) {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -377,25 +523,111 @@ async function savePost(article) {
   });
 }
 
-async function getAllCandidateArticles() {
-  const govArticles = await getGovUzArticles();
-  const baholashArticles = await getTelegramChannelArticles("BaholashUz");
-  const eduuzArticles = await getTelegramChannelArticles("eduuz");
+/**
+ * Helper to check date age in days (allow up to 7 days max).
+ */
+function isFreshArticle(dateStr, maxDays = 7) {
+  if (!dateStr) return true; // If date missing, allow provisionally
+  try {
+    const pubTime = new Date(dateStr).getTime();
+    if (isNaN(pubTime)) return true;
+    const now = Date.now();
+    const diffDays = (now - pubTime) / (1000 * 60 * 60 * 24);
+    return diffDays <= maxDays && diffDays >= -1; // -1 to account for timezone drift
+  } catch {
+    return true;
+  }
+}
 
-  const combined = [...govArticles, ...baholashArticles, ...eduuzArticles];
+/**
+ * Filter out unrelated topics (e.g. motorsport DTM, WWE wrestling, travel deals)
+ */
+function isEducationalArticle(title, text) {
+  const combined = `${title} ${text.slice(0, 500)}`.toLowerCase();
+  const educationalKeywords = [
+    "sertifikat", "sertifikasiya", "imtihon", "test", "uzbmb", "dtm", "ta'lim", "talim",
+    "abituriyent", "otm", "oliy", "maktab", "olimpiada", "maktab", "vazirlik", "cefr",
+    "ielts", "pedagog", "o'qituvchi", "oquvchi", "talaba", "kurs", "grant", "baholash",
+    "matematika", "tarix", "fizika", "biologiya", "kimyo", "til", "fan", "ruxsatnoma",
+    "natija", "ball", "kvota", "qabul", "o'zbekiston", "uzbekistan", "education"
+  ];
+  return educationalKeywords.some(kw => combined.includes(kw));
+}
 
-  const uniqueMap = new Map();
-  for (const art of combined) {
-    const norm = normalizeUrl(art.url);
-    if (!uniqueMap.has(norm)) {
-      uniqueMap.set(norm, art);
+/**
+ * Collect internet news from Google News RSS across multiple topics + Telegram channels.
+ */
+export async function getAllCandidateArticles() {
+  const candidateMap = new Map();
+  const processedUrls = new Set();
+
+  // 1. Google News RSS search across topics
+  for (const topic of SEARCH_TOPICS) {
+    if (candidateMap.size >= 12) break;
+
+    const rssItems = await fetchGoogleNewsRss(topic);
+
+    for (const item of rssItems) {
+      if (candidateMap.size >= 12) break;
+
+      // Filter freshness by pubDateStr
+      if (!isFreshArticle(item.pubDateStr, 7)) continue;
+
+      // Decode Google News URL
+      const decodedUrl = await resolveGoogleNewsUrl(item.googleLink);
+      if (!decodedUrl) continue;
+
+      const normUrl = normalizeUrl(decodedUrl);
+      if (processedUrls.has(normUrl)) continue;
+      processedUrls.add(normUrl);
+
+      // Check Supabase if already posted
+      if (await isPosted(normUrl)) {
+        console.log("Already posted article in Supabase:", normUrl);
+        continue;
+      }
+
+      // Scrape original publisher website
+      const article = await scrapeOriginalArticle(decodedUrl, item.pubDateStr);
+      if (
+        article &&
+        article.title &&
+        article.text &&
+        article.text.length > 50 &&
+        isEducationalArticle(article.title, article.text)
+      ) {
+        const normCanonical = normalizeUrl(article.url);
+        if (await isPosted(normCanonical)) {
+          console.log("Already posted canonical article in Supabase:", normCanonical);
+          continue;
+        }
+
+        candidateMap.set(normCanonical, article);
+        console.log(`FOUND CANDIDATE [${topic}]:`, article.title, `(${article.source})`);
+      }
     }
   }
 
-  return [...uniqueMap.values()];
+  // 2. Supplementary Official Telegram channels
+  if (candidateMap.size < 5) {
+    const baholashArticles = await getTelegramChannelArticles("BaholashUz");
+    const eduuzArticles = await getTelegramChannelArticles("eduuz");
+
+    for (const art of [...baholashArticles, ...eduuzArticles]) {
+      const norm = normalizeUrl(art.url);
+      if (!candidateMap.has(norm) && !(await isPosted(norm))) {
+        candidateMap.set(norm, art);
+      }
+    }
+  }
+
+  return [...candidateMap.values()];
 }
 
-async function chooseNews(articles, groqClient) {
+/**
+ * Select the single best article using Groq AI
+ */
+export async function chooseNews(articles, groqClient) {
   if (!articles || articles.length === 0) return null;
   if (articles.length === 1) return articles[0];
 
@@ -415,13 +647,14 @@ async function chooseNews(articles, groqClient) {
         {
           role: "system",
           content: `Sen ALKHARAZMIY Telegram kanalining rasmiy yangilik tanlovchisisan.
-Quyida rasmiy manbalardan olingan so'nggi yangiliklar ro'yxati berilgan.
-BITTA eng muhim va foydali milliy sertifikat / ta'lim yangiligini tanla.
+Quyida internet va rasmiy manbalardan topilgan so'nggi ta'limiy va milliy sertifikat yangiliklari berilgan.
+BITTA eng muhim, dolzarb va foydali yangilikni tanla.
 
-Ustuvorlik tartibi:
-1. Milliy sertifikat imtihonlari va ro'yxatdan o'tish sanalari / ruxsatnomalar
-2. Rasmiy e'lonlar va o'zgarishlar
-3. Abituriyentlar va o'quvchilar uchun muhim ta'limiy xabarlar
+Ustuvorlik mezonlari:
+1. Milliy sertifikat imtihonlari, ro'yxatdan o'tish sanalari va natijalar
+2. Rasmiy ta'limiy e'lonlar va o'zgarishlar (UZBMB, DTM, OTM, maktab va olimpiada xabarlari)
+3. Abituriyentlar va o'quvchilar uchun eng amaliy va muhim yangiliklar
+4. Yangilikning sarmasi, ishonchliligi va foydaliligi
 
 Faqat va faqat quyidagi JSON formatida javob ber:
 {"index": 0}
@@ -444,13 +677,16 @@ Boshqa hech qanday izoh va matn yozma.`
       return articles[result.index];
     }
   } catch (error) {
-    console.error("AI SELECT ERROR:", error.message);
+    console.warn("AI SELECT ERROR:", error.message);
   }
 
   return articles[0];
 }
 
-async function generatePost(article, groqClient) {
+/**
+ * Generate a short, natural Uzbek Telegram post using Groq AI
+ */
+export async function generatePost(article, groqClient) {
   const randomStyle = POST_STYLES[Math.floor(Math.random() * POST_STYLES.length)];
 
   const completion = await groqClient.chat.completions.create({
@@ -461,18 +697,19 @@ async function generatePost(article, groqClient) {
         content: `Sen ALKHARAZMIY Telegram kanalining tajribali AI kontent menejerisan.
 
 ALKHARAZMIY platformasi URL: ${ALKHARAZMIY_URL}
-ALKHARAZMIY — matematika va barcha Milliy Sertifikat fanlari bo'yicha tayyorgarlik platformasi hamda onlayn mock testlar tizimi.
+ALKHARAZMIY — matematika, barcha fanlar bo'yicha Milliy Sertifikat imtihonlariga tayyorgarlik platformasi hamda onlayn mock testlar tizimi.
 
 QAT'IY QOIDALAR:
-1. FAQT VA FAQAT taqdim etilgan rasmiy manbadagi aniq faktlardan foydalan.
-2. SANA, RAQAM, NARX, BAL, FAN yoki HUDUDLARNI HECH QACHON o'ylab topma yoki o'zgartirma!
-3. Agar taqdim etilgan maqolada yetarli aniq faktlar bo'lmasa yoki xabar noaniq bo'lsa, FAQAT "NO_POST" so'zini qaytar.
-4. O'zbek tilida ravon, tushunarli va qiziqarli yoz.
-5. Post uslubi / formati: ${randomStyle}.
-6. ALKHARAZMIY platformasiga (${ALKHARAZMIY_URL}) tabiiy ravishda qiziqtiruvchi da'vat (CTA) qo'sh (masalan: sertifikat imtihoniga tayyorgarlik va sinov testlari uchun).
-7. Telegram HTML formatidan foydalan (<b>bold</b>, <i>italic</i>, <a href="...">link</a>).
-8. Hech qachon raw markdown (**bold**, ## header) ishlatma.
-9. Post hajmiga e'tibor ber: ixcham va o'qishga qulay bo'lsin.`
+1. FAQT VA FAQAT taqdim etilgan maqoladagi aniq faktlardan foydalan.
+2. SANA, RAQAM, NARX, BAL, FAN yoki HUDUDLARNI HECH QACHON o'ylab topma va gallyutsinatsiya qilma!
+3. Agar taqdim etilgan maqolada yetarli aniq ta'limiy faktlar bo'lmasa, FAQAT "NO_POST" so'zini qaytar.
+4. Post uslubi / formati: ${randomStyle}.
+5. Matnni nusxalamagin, o'quvchida qiziqish va intilish uyg'otadigan qisqa, jonli va ravon o'zbek tilida yoz.
+6. O'quvchilar va abituriyentlar uchun nima uchun muhimligini tushuntir.
+7. ALKHARAZMIY platformasiga (${ALKHARAZMIY_URL}) tabiiy ravishda qiziqtiruvchi da'vat (CTA) qo'sh (masalan: sertifikat imtihoniga tayyorgarlik va sinov testlari uchun).
+8. Asl manba havolasini ushbu formatda kiriting: <a href="${article.url}">Manba: ${article.source}</a>
+9. Telegram HTML formatidan foydalan (<b>bold</b>, <i>italic</i>, <a href="...">link</a>). RAW markdown (**bold**, ## header) ishlatma.
+10. Caption hajmiga mos, ixcham yoz.`
       },
       {
         role: "user",
@@ -481,7 +718,7 @@ SARLAVHA: ${article.title}
 SANA: ${article.date || "Noma'lum"}
 MAQOLA MATNI: ${article.text}
 
-Ushbu rasmiy manba asosida Telegram kanali uchun sifatli Uzbek post yarat. Agar ma'lumot yetarli bo'lmasa, NO_POST deb javob ber.`
+Ushbu manba asosida Telegram kanali uchun sifatli Uzbek post yarat. Agar ma'lumot yetarli bo'lmasa, NO_POST deb javob ber.`
       }
     ],
     temperature: 0.5,
@@ -501,7 +738,7 @@ export function truncateCaption(caption, maxLen = 1024) {
   return truncated + "...";
 }
 
-async function sendTelegram(postText, imageUrl) {
+export async function sendTelegram(postText, imageUrl) {
   const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
@@ -560,7 +797,6 @@ export default async function handler(req, res) {
 
     const CRON_SECRET = process.env.CRON_SECRET;
 
-    // Security check: Check CRON_SECRET if configured
     if (CRON_SECRET) {
       const authHeader = req.headers?.authorization || "";
       const querySecret = req.query?.secret || "";
@@ -583,7 +819,7 @@ export default async function handler(req, res) {
 
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-    // Step 1: Collect news articles from multiple official sources
+    // Step 1: Collect internet news articles across multiple educational search queries
     const candidateArticles = await getAllCandidateArticles();
     console.log("TOTAL CANDIDATE UNPOSTED ARTICLES:", candidateArticles.length);
 
@@ -591,35 +827,35 @@ export default async function handler(req, res) {
       return res.status(200).json({
         success: true,
         published: false,
-        reason: "No new verified official news found."
+        reason: "Yangi rasmiy yoki ishonchli manbalardan ta'limiy yangilik topilmadi."
       });
     }
 
-    // Step 2: Choose the best article using Groq AI
+    // Step 2: Select best article using Groq AI
     const selectedArticle = await chooseNews(candidateArticles, groq);
     if (!selectedArticle) {
       return res.status(200).json({
         success: true,
         published: false,
-        reason: "No suitable article selected."
+        reason: "Munosib yangilik tanlanmadi."
       });
     }
 
-    // Step 3: Generate post using Groq AI with fact-checking prompt
+    // Step 3: Generate Uzbek post content using Groq AI
     const postContent = await generatePost(selectedArticle, groq);
 
     if (!postContent || postContent.toUpperCase().includes("NO_POST")) {
       return res.status(200).json({
         success: true,
         published: false,
-        reason: "Sufficiently verified official facts were not available to create a post."
+        reason: "Yetarlicha aniq faktlar mavjud bo'lmagani sababli post yaratilmadi."
       });
     }
 
     // Step 4: Send post to Telegram channel
     const sendResult = await sendTelegram(postContent, selectedArticle.image);
 
-    // Step 5: Save post to Supabase ONLY after successful Telegram delivery
+    // Step 5: Save post to Supabase only after successful Telegram delivery
     await savePost(selectedArticle);
 
     return res.status(200).json({

@@ -1,11 +1,18 @@
 import Groq from "groq-sdk";
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
-
 export default async function handler(req, res) {
   try {
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: "GROQ_API_KEY environment variable is not configured."
+      });
+    }
+
+    const groq = new Groq({
+      apiKey: process.env.GROQ_API_KEY
+    });
+
     // AI post yaratish
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
@@ -21,7 +28,7 @@ milliy sertifikat va motivatsiya.
 
 Emoji ishlat.
 Postni Telegram formatida yoz.
-Oxirida ALKHARAZMIY platformasiga tabiiy CTA qo'sh.
+Oxirida ALKHARAZMIY platformasiga (https://alkharazmiy.xyz) tabiiy CTA qo'sh.
           `
         },
         {
@@ -34,6 +41,13 @@ Oxirida ALKHARAZMIY platformasiga tabiiy CTA qo'sh.
     });
 
     const post = completion.choices[0].message.content;
+
+    if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHANNEL_ID) {
+      return res.status(500).json({
+        success: false,
+        error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID environment variable is missing."
+      });
+    }
 
     // Telegramga yuborish
     const telegramUrl =
@@ -71,4 +85,4 @@ Oxirida ALKHARAZMIY platformasiga tabiiy CTA qo'sh.
       error: error.message
     });
   }
-          }
+}

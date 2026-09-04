@@ -1,11 +1,18 @@
 import Groq from "groq-sdk";
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
-
 export default async function handler(req, res) {
   try {
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: "GROQ_API_KEY environment variable is not configured."
+      });
+    }
+
+    const groq = new Groq({
+      apiKey: process.env.GROQ_API_KEY
+    });
+
     const models = await groq.models.list();
 
     const activeModels = models.data
@@ -26,4 +33,4 @@ export default async function handler(req, res) {
       error: error.message
     });
   }
-           }
+}
